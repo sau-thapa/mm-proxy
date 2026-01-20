@@ -7,7 +7,7 @@ const WebSocket = require("ws");
 
 require("dotenv").config();
 
-const PORT = process.env.PROXY_PORT || 8787;
+const PORT = process.env.PORT || process.env.PROXY_PORT || 8787;
 const GRPC_HOST = process.env.BROKER_GRPC_HOST || "grpc-broker-api-demo.match-trader.com:443";
 const SYSTEM_UUID = process.env.BROKER_SYSTEM_UUID;
 const AUTH_TOKEN = process.env.BROKER_AUTH_TOKEN;
@@ -129,6 +129,6 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Proxy listening on port ${PORT}`);
 });
