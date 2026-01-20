@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package com.matchtrade.broker_api.grpc;
+
+service QuotationsServiceExternal {
+  rpc getQuotationsWithMarkupStream (PBQuotationsWithMarkupStreamRequestExternal)
+      returns (stream PBQuotationSimpleExternal) {}
+}
+
+message PBQuotationsWithMarkupStreamRequestExternal {
+  string systemUuid = 1;
+  repeated string instruments = 2;
+  optional string group = 3;
+  optional int32 throttlingMs = 4;
+  optional bool smartThrottling = 5;
+}
+
+message PBDailyStatisticsExternal {
+  double change = 1;
+  double high = 2;
+  double low = 3;
+}
+
+message PBQuotation {
+  string symbol = 1;
+  double bidPrice = 2;
+  double askPrice = 3;
+  int64 timestampInMillis = 4;
+  optional PBDailyStatisticsExternal dailyStatistics = 5;
+}
+
+message PBQuotationSimpleExternal {
+  oneof msg {
+    PBQuotation quotation = 1;
+    bool heartbeat = 2;
+  }
+}

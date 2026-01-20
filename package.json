@@ -1,0 +1,16 @@
+{
+  "name": "fxticker-grpc-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "gRPC to WebSocket proxy for Match-Trade quotations stream",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.10.10",
+    "@grpc/proto-loader": "^0.7.13",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}
