@@ -15,10 +15,10 @@ npm install
 2. Set environment variables:
 
 ```bash
-setx BROKER_SYSTEM_UUID "70c5bd6d-14f5-4c8e-b6cf-6b4be3df0d9c"
-setx BROKER_AUTH_TOKEN "PJEcEjqaSx3EQwtI0XYymAJuu6610mqGEWuYXbg_hmE="
-setx BROKER_GRPC_HOST "grpc-broker-api-demo.match-trader.com:443"
-setx PROXY_PORT "8787"
+setx BROKER_SYSTEM_UUID "<SYSTEM_UUID>"
+setx BROKER_AUTH_TOKEN "<AUTH>"
+setx BROKER_GRPC_HOST "<GRPC_HOST>"
+setx PROXY_PORT "<POST>"
 ```
 
 3. Start the proxy:
@@ -32,7 +32,7 @@ npm start
 Connect with instruments in the query string:
 
 ```
-ws://localhost:8787?instruments=EURUSD,GBPUSD,USDJPY
+ws://<GRPC_HOST>?instruments=x,y,z
 ```
 
 Optional params:
