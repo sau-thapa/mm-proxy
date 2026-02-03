@@ -95,7 +95,8 @@ function requestJson(method, targetUrl, body) {
       port: parsed.port || (isHttps ? 443 : 80),
       path: parsed.pathname + parsed.search,
       headers: {
-        "accept": "application/json"
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0 (compatible; MarketMatesProxy/1.0; +https://marketmates.com)"
       }
     };
 
@@ -117,7 +118,7 @@ function requestJson(method, targetUrl, body) {
         try {
           resolve({ status: res.statusCode, json: JSON.parse(data) });
         } catch (err) {
-          resolve({ status: res.statusCode, json: null });
+          resolve({ status: res.statusCode, json: null, text: data });
         }
       });
     });
@@ -176,13 +177,15 @@ async function flushWpUpdates() {
         console.warn("[WP Cache] POST failed:", {
           status: response ? response.status : "no-response",
           group: groupKey || "",
-          count: payload.quotes.length
+          count: payload.quotes.length,
+          body: response && response.text ? response.text.slice(0, 200) : null
         });
       } else {
         console.log("[WP Cache] POST ok:", {
           status: response.status,
           group: groupKey || "",
-          count: payload.quotes.length
+          count: payload.quotes.length,
+          body: response && response.text ? response.text.slice(0, 200) : null
         });
       }
     } catch (err) {
