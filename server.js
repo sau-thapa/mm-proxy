@@ -171,9 +171,26 @@ async function flushWpUpdates() {
       quotes: Array.from(quotesMap.values())
     };
     try {
-      await requestJson("POST", WP_CACHE_URL, payload);
+      const response = await requestJson("POST", WP_CACHE_URL, payload);
+      if (!response || response.status < 200 || response.status >= 300) {
+        console.warn("[WP Cache] POST failed:", {
+          status: response ? response.status : "no-response",
+          group: groupKey || "",
+          count: payload.quotes.length
+        });
+      } else {
+        console.log("[WP Cache] POST ok:", {
+          status: response.status,
+          group: groupKey || "",
+          count: payload.quotes.length
+        });
+      }
     } catch (err) {
-      // Ignore failed syncs; next flush will retry with fresh quotes.
+      console.warn("[WP Cache] POST error:", {
+        group: groupKey || "",
+        count: payload.quotes.length,
+        message: err && err.message ? err.message : String(err)
+      });
     }
   }));
 }
