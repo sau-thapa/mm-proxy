@@ -1,5 +1,6 @@
 const http = require("http");
-const https = require("https");
+const fs = require("fs");
+const fsp = require("fs/promises");
 const path = require("path");
 const url = require("url");
 const grpc = require("@grpc/grpc-js");
@@ -12,9 +13,8 @@ const PORT = process.env.PORT || process.env.PROXY_PORT || 8787;
 const GRPC_HOST = process.env.BROKER_GRPC_HOST || "grpc-broker-api-demo.match-trader.com:443";
 const SYSTEM_UUID = process.env.BROKER_SYSTEM_UUID;
 const AUTH_TOKEN = process.env.BROKER_AUTH_TOKEN;
-const WP_CACHE_URL = process.env.WP_CACHE_URL || "";
-const WP_CACHE_TOKEN = process.env.WP_CACHE_TOKEN || "";
-const WP_CACHE_FLUSH_MS = Math.max(500, parseInt(process.env.WP_CACHE_FLUSH_MS, 10) || 2000);
+const CACHE_FILE_PATH = process.env.CACHE_FILE_PATH || path.join(__dirname, "data", "quote-cache.json");
+const CACHE_FLUSH_MS = Math.max(500, parseInt(process.env.CACHE_FLUSH_MS, 10) || 5000);
 
 if (!SYSTEM_UUID || !AUTH_TOKEN) {
   console.error("Missing BROKER_SYSTEM_UUID or BROKER_AUTH_TOKEN.");
@@ -37,8 +37,8 @@ const grpcClient = new grpcPackage.QuotationsServiceExternal(
 );
 
 const quoteCache = new Map();
-const pendingWpUpdates = new Map();
-let wpFlushTimer = null;
+let cacheFlushTimer = null;
+let cacheDirty = false;
 
 function normalizeToken(token) {
   if (!token) return "";
@@ -58,79 +58,6 @@ function parseInstruments(value) {
     .filter((item) => item.length > 0);
 }
 
-function parseJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (chunk) => {
-      data += chunk;
-      if (data.length > 1_000_000) {
-        reject(new Error("Payload too large."));
-        req.destroy();
-      }
-    });
-    req.on("end", () => {
-      if (!data) {
-        resolve(null);
-        return;
-      }
-      try {
-        resolve(JSON.parse(data));
-      } catch (err) {
-        reject(err);
-      }
-    });
-  });
-}
-
-function requestJson(method, targetUrl, body) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(targetUrl);
-    const payload = body ? JSON.stringify(body) : null;
-    const isHttps = parsed.protocol === "https:";
-    const client = isHttps ? https : http;
-
-    const options = {
-      method: method,
-      hostname: parsed.hostname,
-      port: parsed.port || (isHttps ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      headers: {
-        "accept": "application/json",
-        "user-agent": "Mozilla/5.0 (compatible; MarketMatesProxy/1.0; +https://marketmates.com)"
-      }
-    };
-
-    if (payload) {
-      options.headers["content-type"] = "application/json";
-      options.headers["content-length"] = Buffer.byteLength(payload);
-    }
-
-    const req = client.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => {
-        data += chunk;
-      });
-      res.on("end", () => {
-        if (!data) {
-          resolve({ status: res.statusCode, json: null });
-          return;
-        }
-        try {
-          resolve({ status: res.statusCode, json: JSON.parse(data) });
-        } catch (err) {
-          resolve({ status: res.statusCode, json: null, text: data });
-        }
-      });
-    });
-
-    req.on("error", reject);
-    if (payload) {
-      req.write(payload);
-    }
-    req.end();
-  });
-}
-
 function getCacheKey(group) {
   return group ? String(group) : "";
 }
@@ -143,6 +70,7 @@ function cacheQuote(group, quotation) {
   }
   const groupCache = quoteCache.get(key);
   groupCache.set(quotation.symbol, quotation);
+  cacheDirty = true;
 }
 
 function getCachedQuote(group, symbol) {
@@ -151,92 +79,64 @@ function getCachedQuote(group, symbol) {
   return groupCache.get(symbol) || null;
 }
 
-function enqueueWpUpdate(group, quotation) {
-  if (!WP_CACHE_URL || !WP_CACHE_TOKEN || !quotation || !quotation.symbol) return;
-  const key = getCacheKey(group);
-  if (!pendingWpUpdates.has(key)) {
-    pendingWpUpdates.set(key, new Map());
-  }
-  pendingWpUpdates.get(key).set(quotation.symbol, quotation);
+function serializeCache() {
+  const groups = {};
+  quoteCache.forEach((groupCache, groupKey) => {
+    const sorted = Array.from(groupCache.values()).sort((a, b) => {
+      const ta = a && a.timestampInMillis ? Number(a.timestampInMillis) : 0;
+      const tb = b && b.timestampInMillis ? Number(b.timestampInMillis) : 0;
+      return tb - ta;
+    });
+    groups[groupKey] = sorted.slice(0, 500);
+  });
+  return { groups };
 }
 
-async function flushWpUpdates() {
-  if (!WP_CACHE_URL || !WP_CACHE_TOKEN || pendingWpUpdates.size === 0) return;
-  const batches = Array.from(pendingWpUpdates.entries());
-  pendingWpUpdates.clear();
-
-  await Promise.all(batches.map(async ([groupKey, quotesMap]) => {
-    const payload = {
-      token: WP_CACHE_TOKEN,
-      group: groupKey || "",
-      quotes: Array.from(quotesMap.values())
-    };
-    try {
-      const response = await requestJson("POST", WP_CACHE_URL, payload);
-      if (!response || response.status < 200 || response.status >= 300) {
-        console.warn("[WP Cache] POST failed:", {
-          status: response ? response.status : "no-response",
-          group: groupKey || "",
-          count: payload.quotes.length,
-          body: response && response.text ? response.text.slice(0, 200) : null
-        });
-      } else {
-        console.log("[WP Cache] POST ok:", {
-          status: response.status,
-          group: groupKey || "",
-          count: payload.quotes.length,
-          body: response && response.text ? response.text.slice(0, 200) : null
-        });
-      }
-    } catch (err) {
-      console.warn("[WP Cache] POST error:", {
-        group: groupKey || "",
-        count: payload.quotes.length,
-        message: err && err.message ? err.message : String(err)
-      });
-    }
-  }));
-}
-
-function scheduleWpFlush() {
-  if (!WP_CACHE_URL || !WP_CACHE_TOKEN) return;
-  if (wpFlushTimer) return;
-  wpFlushTimer = setInterval(() => {
-    flushWpUpdates();
-  }, WP_CACHE_FLUSH_MS);
-}
-
-async function hydrateFromWpCache(instruments, group, result) {
-  if (!WP_CACHE_URL) return result;
-  let query = "instruments=" + encodeURIComponent(instruments.join(","));
-  if (group) {
-    query += "&group=" + encodeURIComponent(group);
-  }
-  if (WP_CACHE_TOKEN) {
-    query += "&token=" + encodeURIComponent(WP_CACHE_TOKEN);
-  }
-  const targetUrl = WP_CACHE_URL.indexOf("?") === -1 ?
-    WP_CACHE_URL + "?" + query :
-    WP_CACHE_URL + "&" + query;
-
+function hydrateCacheFromFile() {
   try {
-    const response = await requestJson("GET", targetUrl, null);
-    if (response.status !== 200 || !response.json || !Array.isArray(response.json.quotes)) {
-      return result;
-    }
-    response.json.quotes.forEach((quote) => {
-      if (!quote || !quote.symbol) return;
-      result.set(quote.symbol, quote);
+    if (!fs.existsSync(CACHE_FILE_PATH)) return;
+    const raw = fs.readFileSync(CACHE_FILE_PATH, "utf8");
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || !parsed.groups) return;
+    Object.keys(parsed.groups).forEach((groupKey) => {
+      const entries = parsed.groups[groupKey];
+      if (!Array.isArray(entries)) return;
+      const map = new Map();
+      entries.forEach((quote) => {
+        if (!quote || !quote.symbol) return;
+        map.set(quote.symbol, quote);
+      });
+      if (map.size) {
+        quoteCache.set(groupKey, map);
+      }
     });
   } catch (err) {
-    // Ignore WP cache failures; fallback to stream.
+    console.warn("Failed to load cache file:", err && err.message ? err.message : String(err));
   }
+}
 
-  return result;
+async function flushCacheToFile() {
+  if (!cacheDirty) return;
+  cacheDirty = false;
+  try {
+    await fsp.mkdir(path.dirname(CACHE_FILE_PATH), { recursive: true });
+    const payload = JSON.stringify(serializeCache());
+    await fsp.writeFile(CACHE_FILE_PATH, payload, "utf8");
+  } catch (err) {
+    console.warn("Failed to write cache file:", err && err.message ? err.message : String(err));
+  }
+}
+
+function scheduleCacheFlush() {
+  if (cacheFlushTimer) return;
+  cacheFlushTimer = setInterval(() => {
+    flushCacheToFile();
+  }, CACHE_FLUSH_MS);
 }
 
 function collectSnapshot(instruments, group, timeoutMs) {
-  return new Promise(async (resolve) => {
+  return new Promise((resolve) => {
     const result = new Map();
     instruments.forEach((symbol) => {
       const cached = getCachedQuote(group, symbol);
@@ -244,10 +144,6 @@ function collectSnapshot(instruments, group, timeoutMs) {
         result.set(symbol, cached);
       }
     });
-
-    if (result.size < instruments.length) {
-      await hydrateFromWpCache(instruments.filter((symbol) => !result.has(symbol)), group, result);
-    }
 
     if (result.size === instruments.length) {
       resolve({
@@ -395,7 +291,6 @@ wss.on("connection", (ws, req) => {
     if (response.quotation) {
       const quotation = response.quotation;
       cacheQuote(request.group, quotation);
-      enqueueWpUpdate(request.group, quotation);
       send({
         type: "quotation",
         symbol: quotation.symbol,
@@ -430,4 +325,5 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Proxy listening on port ${PORT}`);
 });
 
-scheduleWpFlush();
+hydrateCacheFromFile();
+scheduleCacheFlush();
