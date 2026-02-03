@@ -1,4 +1,5 @@
 const http = require("http");
+const https = require("https");
 const path = require("path");
 const url = require("url");
 const grpc = require("@grpc/grpc-js");
@@ -11,6 +12,9 @@ const PORT = process.env.PORT || process.env.PROXY_PORT || 8787;
 const GRPC_HOST = process.env.BROKER_GRPC_HOST || "grpc-broker-api-demo.match-trader.com:443";
 const SYSTEM_UUID = process.env.BROKER_SYSTEM_UUID;
 const AUTH_TOKEN = process.env.BROKER_AUTH_TOKEN;
+const WP_CACHE_URL = process.env.WP_CACHE_URL || "";
+const WP_CACHE_TOKEN = process.env.WP_CACHE_TOKEN || "";
+const WP_CACHE_FLUSH_MS = Math.max(500, parseInt(process.env.WP_CACHE_FLUSH_MS, 10) || 2000);
 
 if (!SYSTEM_UUID || !AUTH_TOKEN) {
   console.error("Missing BROKER_SYSTEM_UUID or BROKER_AUTH_TOKEN.");
@@ -32,6 +36,10 @@ const grpcClient = new grpcPackage.QuotationsServiceExternal(
   grpc.credentials.createSsl()
 );
 
+const quoteCache = new Map();
+const pendingWpUpdates = new Map();
+let wpFlushTimer = null;
+
 function normalizeToken(token) {
   if (!token) return "";
   return token.toLowerCase().startsWith("bearer ") ? token : "Bearer " + token;
@@ -50,7 +58,274 @@ function parseInstruments(value) {
     .filter((item) => item.length > 0);
 }
 
-const server = http.createServer((req, res) => {
+function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 1_000_000) {
+        reject(new Error("Payload too large."));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (!data) {
+        resolve(null);
+        return;
+      }
+      try {
+        resolve(JSON.parse(data));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+function requestJson(method, targetUrl, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(targetUrl);
+    const payload = body ? JSON.stringify(body) : null;
+    const isHttps = parsed.protocol === "https:";
+    const client = isHttps ? https : http;
+
+    const options = {
+      method: method,
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      headers: {
+        "accept": "application/json"
+      }
+    };
+
+    if (payload) {
+      options.headers["content-type"] = "application/json";
+      options.headers["content-length"] = Buffer.byteLength(payload);
+    }
+
+    const req = client.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        if (!data) {
+          resolve({ status: res.statusCode, json: null });
+          return;
+        }
+        try {
+          resolve({ status: res.statusCode, json: JSON.parse(data) });
+        } catch (err) {
+          resolve({ status: res.statusCode, json: null });
+        }
+      });
+    });
+
+    req.on("error", reject);
+    if (payload) {
+      req.write(payload);
+    }
+    req.end();
+  });
+}
+
+function getCacheKey(group) {
+  return group ? String(group) : "";
+}
+
+function cacheQuote(group, quotation) {
+  if (!quotation || !quotation.symbol) return;
+  const key = getCacheKey(group);
+  if (!quoteCache.has(key)) {
+    quoteCache.set(key, new Map());
+  }
+  const groupCache = quoteCache.get(key);
+  groupCache.set(quotation.symbol, quotation);
+}
+
+function getCachedQuote(group, symbol) {
+  const groupCache = quoteCache.get(getCacheKey(group));
+  if (!groupCache) return null;
+  return groupCache.get(symbol) || null;
+}
+
+function enqueueWpUpdate(group, quotation) {
+  if (!WP_CACHE_URL || !WP_CACHE_TOKEN || !quotation || !quotation.symbol) return;
+  const key = getCacheKey(group);
+  if (!pendingWpUpdates.has(key)) {
+    pendingWpUpdates.set(key, new Map());
+  }
+  pendingWpUpdates.get(key).set(quotation.symbol, quotation);
+}
+
+async function flushWpUpdates() {
+  if (!WP_CACHE_URL || !WP_CACHE_TOKEN || pendingWpUpdates.size === 0) return;
+  const batches = Array.from(pendingWpUpdates.entries());
+  pendingWpUpdates.clear();
+
+  await Promise.all(batches.map(async ([groupKey, quotesMap]) => {
+    const payload = {
+      token: WP_CACHE_TOKEN,
+      group: groupKey || "",
+      quotes: Array.from(quotesMap.values())
+    };
+    try {
+      await requestJson("POST", WP_CACHE_URL, payload);
+    } catch (err) {
+      // Ignore failed syncs; next flush will retry with fresh quotes.
+    }
+  }));
+}
+
+function scheduleWpFlush() {
+  if (!WP_CACHE_URL || !WP_CACHE_TOKEN) return;
+  if (wpFlushTimer) return;
+  wpFlushTimer = setInterval(() => {
+    flushWpUpdates();
+  }, WP_CACHE_FLUSH_MS);
+}
+
+async function hydrateFromWpCache(instruments, group, result) {
+  if (!WP_CACHE_URL) return result;
+  let query = "instruments=" + encodeURIComponent(instruments.join(","));
+  if (group) {
+    query += "&group=" + encodeURIComponent(group);
+  }
+  if (WP_CACHE_TOKEN) {
+    query += "&token=" + encodeURIComponent(WP_CACHE_TOKEN);
+  }
+  const targetUrl = WP_CACHE_URL.indexOf("?") === -1 ?
+    WP_CACHE_URL + "?" + query :
+    WP_CACHE_URL + "&" + query;
+
+  try {
+    const response = await requestJson("GET", targetUrl, null);
+    if (response.status !== 200 || !response.json || !Array.isArray(response.json.quotes)) {
+      return result;
+    }
+    response.json.quotes.forEach((quote) => {
+      if (!quote || !quote.symbol) return;
+      result.set(quote.symbol, quote);
+    });
+  } catch (err) {
+    // Ignore WP cache failures; fallback to stream.
+  }
+
+  return result;
+}
+
+function collectSnapshot(instruments, group, timeoutMs) {
+  return new Promise(async (resolve) => {
+    const result = new Map();
+    instruments.forEach((symbol) => {
+      const cached = getCachedQuote(group, symbol);
+      if (cached) {
+        result.set(symbol, cached);
+      }
+    });
+
+    if (result.size < instruments.length) {
+      await hydrateFromWpCache(instruments.filter((symbol) => !result.has(symbol)), group, result);
+    }
+
+    if (result.size === instruments.length) {
+      resolve({
+        quotes: Array.from(result.values()),
+        missing: [],
+        source: "cache"
+      });
+      return;
+    }
+
+    const request = {
+      systemUuid: SYSTEM_UUID,
+      instruments: instruments
+    };
+    if (group) {
+      request.group = String(group);
+    }
+
+    const metadata = new grpc.Metadata();
+    metadata.set("authorization", normalizeToken(AUTH_TOKEN));
+
+    const call = grpcClient.getQuotationsWithMarkupStream(request, metadata);
+
+    const timer = setTimeout(() => {
+      call.cancel();
+      resolve({
+        quotes: Array.from(result.values()),
+        missing: instruments.filter((symbol) => !result.has(symbol)),
+        source: "stream-timeout"
+      });
+    }, timeoutMs);
+
+    call.on("data", (response) => {
+      if (!response.quotation) return;
+      const quotation = response.quotation;
+      result.set(quotation.symbol, quotation);
+      cacheQuote(group, quotation);
+      if (result.size === instruments.length) {
+        clearTimeout(timer);
+        call.cancel();
+        resolve({
+          quotes: Array.from(result.values()),
+          missing: [],
+          source: "stream"
+        });
+      }
+    });
+
+    call.on("error", () => {
+      clearTimeout(timer);
+      resolve({
+        quotes: Array.from(result.values()),
+        missing: instruments.filter((symbol) => !result.has(symbol)),
+        source: "stream-error"
+      });
+    });
+
+    call.on("end", () => {
+      clearTimeout(timer);
+      resolve({
+        quotes: Array.from(result.values()),
+        missing: instruments.filter((symbol) => !result.has(symbol)),
+        source: "stream-end"
+      });
+    });
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = url.parse(req.url || "", true);
+  const pathname = parsedUrl.pathname || "/";
+
+  if (pathname === "/snapshot") {
+    const query = parsedUrl.query || {};
+    const instruments = parseInstruments(query.instruments);
+    const group = query.group ? String(query.group) : "";
+    const timeoutMs = Math.max(500, Math.min(5000, parseInt(query.timeoutMs, 10) || 1500));
+
+    res.setHeader("access-control-allow-origin", "*");
+    res.setHeader("content-type", "application/json");
+
+    if (!instruments.length) {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: "Missing instruments list." }));
+      return;
+    }
+
+    try {
+      const snapshot = await collectSnapshot(instruments, group, timeoutMs);
+      res.statusCode = 200;
+      res.end(JSON.stringify(snapshot));
+    } catch (err) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: "Snapshot failed." }));
+    }
+    return;
+  }
+
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("FX ticker gRPC proxy is running.");
 });
@@ -99,6 +374,8 @@ wss.on("connection", (ws, req) => {
   call.on("data", (response) => {
     if (response.quotation) {
       const quotation = response.quotation;
+      cacheQuote(request.group, quotation);
+      enqueueWpUpdate(request.group, quotation);
       send({
         type: "quotation",
         symbol: quotation.symbol,
@@ -132,3 +409,5 @@ wss.on("connection", (ws, req) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Proxy listening on port ${PORT}`);
 });
+
+scheduleWpFlush();
